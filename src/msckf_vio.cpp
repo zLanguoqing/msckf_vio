@@ -57,6 +57,11 @@ MsckfVio::MsckfVio(ros::NodeHandle& pnh):
   return;
 }
 /*加载滤波所需参数*/
+/**
+ * @brief 加载滤波所需参数以及相对应的初始值
+ * 
+ * @return  bool
+ */
 bool MsckfVio::loadParameters() {
   // Frame id
   nh.param<string>("fixed_frame_id", fixed_frame_id, "world");
@@ -92,6 +97,7 @@ bool MsckfVio::loadParameters() {
   // implicitly. But the initial velocity and bias can be
   // set by parameters.
   // TODO: is it reasonable to set the initial bias to 0?
+  // IMU系统速度的初始值
   nh.param<double>("initial_state/velocity/x",
       state_server.imu_state.velocity(0), 0.0);
   nh.param<double>("initial_state/velocity/y",
@@ -102,6 +108,7 @@ bool MsckfVio::loadParameters() {
   // The initial covariance of orientation and position can be
   // set to 0. But for velocity, bias and extrinsic parameters,
   // there should be nontrivial uncertainty.
+  // 加速度 线速度 速度的协方差初始值
   double gyro_bias_cov, acc_bias_cov, velocity_cov;
   nh.param<double>("initial_covariance/velocity",
       velocity_cov, 0.25);
@@ -110,12 +117,13 @@ bool MsckfVio::loadParameters() {
   nh.param<double>("initial_covariance/acc_bias",
       acc_bias_cov, 1e-2);
 
+  // 外参，相机和IMU的，旋转量的协方差和平移量的协方差初始值
   double extrinsic_rotation_cov, extrinsic_translation_cov;
   nh.param<double>("initial_covariance/extrinsic_rotation_cov",
       extrinsic_rotation_cov, 3.0462e-4);
   nh.param<double>("initial_covariance/extrinsic_translation_cov",
       extrinsic_translation_cov, 1e-4);
-
+  // 系统协方差的初始值
   state_server.state_cov = MatrixXd::Zero(21, 21);
   for (int i = 3; i < 6; ++i)
     state_server.state_cov(i, i) = gyro_bias_cov;
@@ -129,9 +137,10 @@ bool MsckfVio::loadParameters() {
     state_server.state_cov(i, i) = extrinsic_translation_cov;
 
   // Transformation offsets between the frames involved.
+  // 外参  T_imu_cam0 表示 IMU 2 cam
   Isometry3d T_imu_cam0 = utils::getTransformEigen(nh, "cam0/T_cam_imu");
   Isometry3d T_cam0_imu = T_imu_cam0.inverse();
-
+  // 
   state_server.imu_state.R_imu_cam0 = T_cam0_imu.linear().transpose();
   state_server.imu_state.t_cam0_imu = T_cam0_imu.translation();
   CAMState::T_cam0_cam1 =
@@ -175,20 +184,26 @@ bool MsckfVio::loadParameters() {
   ROS_INFO("===========================================");
   return true;
 }
-/*
-*前端出入后端接口
-*/
+
+/**
+ * @brief 开启ROS接受前端信息的接口
+ * 
+ * @return  bool
+ */
 bool MsckfVio::createRosIO() {
+  // odom_pub 里程计发布主题
   odom_pub = nh.advertise<nav_msgs::Odometry>("odom", 10);
+  // feature_pub 特征点发布主题
   feature_pub = nh.advertise<sensor_msgs::PointCloud2>(
       "feature_point_cloud", 10);
-
+  // 系统丢失后重新初始化系统 resetCallback为重出始化接口
+  // 没有重定位功能
   reset_srv = nh.advertiseService("reset",
       &MsckfVio::resetCallback, this);
-// imu接收数据
+// imu接收数据接口imuCallback
   imu_sub = nh.subscribe("imu", 100,
       &MsckfVio::imuCallback, this);
-// 特征点接收数据
+// 特征点接收数据featureCallback
   feature_sub = nh.subscribe("features", 40,
       &MsckfVio::featureCallback, this);
 
@@ -198,12 +213,18 @@ bool MsckfVio::createRosIO() {
 
   return true;
 }
-
+/**
+ * @brief msckf系统初始化，包括系统协方差，噪声方差，同时开启ROS接受前端数据
+ * 
+ * @return  bool
+ */
 bool MsckfVio::initialize() {
+  // 加载msckf所需参数
   if (!loadParameters()) return false;
   ROS_INFO("Finish loading ROS parameters...");
 
   // Initialize state server
+  // 系统噪声矩阵 bg ng ba na
   state_server.continuous_noise_cov =
     Matrix<double, 12, 12>::Zero();
   state_server.continuous_noise_cov.block<3, 3>(0, 0) =
@@ -217,6 +238,7 @@ bool MsckfVio::initialize() {
 
   // Initialize the chi squared test table with confidence
   // level 0.95.
+  // 卡方检验表格，用于检验特征点观测是否正确
   for (int i = 1; i < 100; ++i) {
     boost::math::chi_squared chi_squared_dist(i);
     chi_squared_test_table[i] =
@@ -228,7 +250,11 @@ bool MsckfVio::initialize() {
 
   return true;
 }
-
+/**
+ * @brief msckf系统初始化，包括系统协方差，噪声方差，同时开启ROS接受前端数据
+ * @param msg          // 前端IMU数据数据
+ * @return  void
+ */
 void MsckfVio::imuCallback(
     const sensor_msgs::ImuConstPtr& msg) {
 
@@ -236,48 +262,62 @@ void MsckfVio::imuCallback(
   // being processed immediately. The IMU msgs are processed
   // when the next image is available, in which way, we can
   // easily handle the transfer delay.
+  // 把IMU数据放入imu_msg_buffer中
   imu_msg_buffer.push_back(*msg);
-
+  // is_gravity_set IMU是否初始化过，如果没有初始化过，则进入初始化
   if (!is_gravity_set) {
+    // 需要充足的IMU数据进行初始化，如果没有200帧的IMU数据则不初始化
     if (imu_msg_buffer.size() < 200) return;
     //if (imu_msg_buffer.size() < 10) return;
+    // 初始化，静态初始化就一定成功吗？
     initializeGravityAndBias();
+    // is_gravity_set设置为true 下次就不在进入
     is_gravity_set = true;
   }
 
   return;
 }
+/**
+ * @brief IMU静态初始化，得到bg和旋转量初始值
 
+ * @return  void
+ */
 void MsckfVio::initializeGravityAndBias() {
 
   // Initialize gravity and gyro bias.
   Vector3d sum_angular_vel = Vector3d::Zero();
   Vector3d sum_linear_acc = Vector3d::Zero();
-
+  // 把之前的200帧IMU数据计算角速度的平均值和加速度的平均值
   for (const auto& imu_msg : imu_msg_buffer) {
     Vector3d angular_vel = Vector3d::Zero();
     Vector3d linear_acc = Vector3d::Zero();
-
+    // 数据类型的转换
     tf::vectorMsgToEigen(imu_msg.angular_velocity, angular_vel);
     tf::vectorMsgToEigen(imu_msg.linear_acceleration, linear_acc);
 
     sum_angular_vel += angular_vel;
     sum_linear_acc += linear_acc;
   }
-
+  // 把角速度的平均值当做bg初始值
   state_server.imu_state.gyro_bias =
     sum_angular_vel / imu_msg_buffer.size();
   //IMUState::gravity =
   //  -sum_linear_acc / imu_msg_buffer.size();
   // This is the gravity in the IMU frame.
+  // 计算加速度的平均值
   Vector3d gravity_imu =
     sum_linear_acc / imu_msg_buffer.size();
 
   // Initialize the initial orientation, so that the estimation
   // is consistent with the inertial frame.
+  // 加速度的模长，用这个加速度的模长当做IMU重力模长
   double gravity_norm = gravity_imu.norm();
-  IMUState::gravity = Vector3d(0.0, 0.0, -gravity_norm);
 
+  IMUState::gravity = Vector3d(0.0, 0.0, -gravity_norm);
+  // gravity_imu IMU的重力方向，代表真实的重力方向
+  // IMUState::gravity 表示SLAM系统的重力方向
+  // FromTwoVectors 计算gravity_imu和IMUState::gravity之间的夹角
+  // q0_i_w 说明可以将SLAM坐标系与真实世界坐标系对齐
   Quaterniond q0_i_w = Quaterniond::FromTwoVectors(
     gravity_imu, -IMUState::gravity);
   state_server.imu_state.orientation =
@@ -359,7 +399,11 @@ bool MsckfVio::resetCallback(
   ROS_WARN("Resetting msckf vio completed...");
   return true;
 }
-
+/**
+ * @brief msckf主函数，后端优化都是这个函数
+ * @param msg          // 前端图像数据数据，特征点信息
+ * @return  void
+ */
 void MsckfVio::featureCallback(
     const CameraMeasurementConstPtr& msg) {
 
@@ -371,6 +415,7 @@ void MsckfVio::featureCallback(
   // The frame where the first image is received will be
   // the origin.
   // 是否是第一帧图像信息
+  // 记录第一帧图像的时间作为系统状态时间
   if (is_first_img) {
     is_first_img = false;
     state_server.imu_state.time = msg->header.stamp.toSec();
@@ -514,27 +559,39 @@ void MsckfVio::mocapOdomCallback(
   mocap_odom_pub.publish(mocap_odom_msg);
   return;
 }
-/*
-*imu数据的批处理
-*/
+/**
+ * @brief IMU数据处理，主要是预积分和系统协方差的初步计算
+ * @param time_bound          // 图像信息时间戳
+ * @return  void
+ */
 void MsckfVio::batchImuProcessing(const double& time_bound) {
   // Counter how many IMU msgs in the buffer are used.
+  // used_imu_msg_cntr 记录IMU的使用量，可以将使用过的IMU数据从
+  // imu_msg_buffer中剔除，不重复使用
   int used_imu_msg_cntr = 0;
 
   for (const auto& imu_msg : imu_msg_buffer) {
+    // 根据图像时间来选取IMU数据
+    // imu_time 为IMU时间戳
+    // imu_state.time 为上一时刻的系统时间戳
+    // 如果IMU数据的时间小于上一时刻的，就没必要用了
     double imu_time = imu_msg.header.stamp.toSec();
     if (imu_time < state_server.imu_state.time) {
       ++used_imu_msg_cntr;
       continue;
     }
+    // 如果大于当前图像的时间戳，也不用，只用上一时刻到当前时刻之间的时间戳
+    // 这里IMU数据的选取不太严格
     if (imu_time > time_bound) break;
 
     // Convert the msgs.
     Vector3d m_gyro, m_acc;
+    // m_gyro m_acc 代表角速度和加速度
     tf::vectorMsgToEigen(imu_msg.angular_velocity, m_gyro);
     tf::vectorMsgToEigen(imu_msg.linear_acceleration, m_acc);
 
     // Execute process model.
+    // IMU预积分和系统协方差矩阵的计算
     processModel(imu_time, m_gyro, m_acc);
     ++used_imu_msg_cntr;
   }
@@ -553,20 +610,32 @@ void MsckfVio::batchImuProcessing(const double& time_bound) {
 *计算转移矩阵，与噪声协方差矩阵
 IMU预积分，采用RK4方法进行积分
 */
+/**
+ * @brief F矩阵与G矩阵计算
+ * @brief 计算转移矩阵，与噪声协方差矩阵
+ * @brief IMU预积分，采用RK4方法进行积分
+ * @param time          // 当前帧的IMU时间戳
+ * @param m_gyro          // 当前帧的IMU的角速度
+ * @param m_acc          // 当前帧的IMU加速度
+ * @return  void
+ */
 void MsckfVio::processModel(const double& time,
     const Vector3d& m_gyro,
     const Vector3d& m_acc) {
 
   // Remove the bias from the measured gyro and acceleration
   IMUState& imu_state = state_server.imu_state;
+  //现将IMU中的加速度和角速度去偏置
   Vector3d gyro = m_gyro - imu_state.gyro_bias;
   Vector3d acc = m_acc - imu_state.acc_bias;
+  // 计算时间差
   double dtime = time - imu_state.time;
 
   // Compute discrete transition and noise covariance matrix
+  // 论文中离散条件下的误差模型中的F矩阵和G矩阵
   Matrix<double, 21, 21> F = Matrix<double, 21, 21>::Zero();
   Matrix<double, 21, 12> G = Matrix<double, 21, 12>::Zero();
-
+  // 根据公式得出
   F.block<3, 3>(0, 0) = -skewSymmetric(gyro);
   F.block<3, 3>(0, 3) = -Matrix3d::Identity();
   F.block<3, 3>(6, 0) = -quaternionToRotation(
@@ -584,6 +653,7 @@ void MsckfVio::processModel(const double& time,
   // Approximate matrix exponential to the 3rd order,
   // which can be considered to be accurate enough assuming
   // dtime is within 0.01s.
+  //计算状态转移矩阵
   Matrix<double, 21, 21> Fdt = F * dtime;
   Matrix<double, 21, 21> Fdt_square = Fdt * Fdt;
   Matrix<double, 21, 21> Fdt_cube = Fdt_square * Fdt;
@@ -591,12 +661,13 @@ void MsckfVio::processModel(const double& time,
     Fdt + 0.5*Fdt_square + (1.0/6.0)*Fdt_cube;
 
   // Propogate the state using 4th order Runge-Kutta
+  // 采用RK4进行预积分，并得到对当前状态的预测
   predictNewState(dtime, gyro, acc);
 
   // Modify the transition matrix
   // 由于在不同点线性化，导致零空间崩塌，所以需要维持零空间维数不变
   // 与黄老师提出的FEJ不同的是，该方法采用零空间按照传播公式传播，则零空间不会崩塌
-  // 所以需要调整转移矩阵
+  // 所以需要调整转移矩阵，但是其实零空间内本也会带来漂移，这一块他忽略了
   Matrix3d R_kk_1 = quaternionToRotation(imu_state.orientation_null);
   Phi.block<3, 3>(0, 0) =
     quaternionToRotation(imu_state.orientation) * R_kk_1.transpose();
