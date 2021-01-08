@@ -249,16 +249,17 @@ void Feature::generateInitialGuess(
 
 bool Feature::checkMotion(
     const CamStateServer& cam_states) const {
-
+  // 观测信息的第一帧和最后一帧
   const StateIDType& first_cam_id = observations.begin()->first;
   const StateIDType& last_cam_id = (--observations.end())->first;
-
+  // 观测信息的第一帧相机的对应的位姿，linear代表旋转量，表示cam 2 world
   Eigen::Isometry3d first_cam_pose;
   first_cam_pose.linear() = quaternionToRotation(
       cam_states.find(first_cam_id)->second.orientation).transpose();
+  // translation 表示相机的位移 cam 2 world
   first_cam_pose.translation() =
     cam_states.find(first_cam_id)->second.position;
-
+// 这里是最后一帧的图像信息
   Eigen::Isometry3d last_cam_pose;
   last_cam_pose.linear() = quaternionToRotation(
       cam_states.find(last_cam_id)->second.orientation).transpose();
@@ -267,6 +268,7 @@ bool Feature::checkMotion(
 
   // Get the direction of the feature when it is first observed.
   // This direction is represented in the world frame.
+  // 计算世界坐标系下的点到相机的角度
   Eigen::Vector3d feature_direction(
       observations.begin()->second(0),
       observations.begin()->second(1), 1.0);

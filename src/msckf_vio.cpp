@@ -605,11 +605,7 @@ void MsckfVio::batchImuProcessing(const double& time_bound) {
 
   return;
 }
-/*
-*F矩阵与G矩阵计算
-*计算转移矩阵，与噪声协方差矩阵
-IMU预积分，采用RK4方法进行积分
-*/
+
 /**
  * @brief F矩阵与G矩阵计算
  * @brief 计算转移矩阵，与噪声协方差矩阵
@@ -719,10 +715,14 @@ void MsckfVio::processModel(const double& time,
   state_server.imu_state.time = time;
   return;
 }
-/*
-*IMU预积分
-*/
 
+/**
+ * @brief IMU预积分
+ * @param dt            // 时间差
+ * @param gyro          // 当前帧的IMU的角速度
+ * @param acc          // 当前帧的IMU加速度
+ * @return  void
+ */
 void MsckfVio::predictNewState(const double& dt,
     const Vector3d& gyro,
     const Vector3d& acc) {
@@ -734,13 +734,13 @@ void MsckfVio::predictNewState(const double& dt,
   Omega.block<3, 3>(0, 0) = -skewSymmetric(gyro);
   Omega.block<3, 1>(0, 3) = gyro;
   Omega.block<1, 3>(3, 0) = -gyro;
-
+  // 先取出当前状态的位姿，这里是引用
   Vector4d& q = state_server.imu_state.orientation;
   Vector3d& v = state_server.imu_state.velocity;
   Vector3d& p = state_server.imu_state.position;
 
   // Some pre-calculation
-  // 零阶四元素展开
+  // 零阶四元数展开计算旋转量
   Vector4d dq_dt, dq_dt2;
   if (gyro_norm > 1e-5) {
     dq_dt = (cos(gyro_norm*dt*0.5)*Matrix4d::Identity() +
@@ -781,6 +781,7 @@ void MsckfVio::predictNewState(const double& dt,
   Vector3d k4_p_dot = k3_v;
 
   // yn+1 = yn + dt/6*(k1+2*k2+2*k3+k4)
+  // 直接将预积分量加到当前状态上，得到对当前状态的预测值
   q = dq_dt;
   quaternionNormalize(q);
   v = v + dt/6*(k1_v_dot+2*k2_v_dot+2*k3_v_dot+k4_v_dot);
@@ -788,31 +789,39 @@ void MsckfVio::predictNewState(const double& dt,
 
   return;
 }
-/*
-*根据IMU预测值计算相机位姿
-*系统协方差矩阵的曾广
-*/
+/**
+ * @brief 来了新的相机信息之后，对系统协方差矩阵进行扩增
+ * @param time            // 当前状态的信息
+
+ * @return  void
+ */
 void MsckfVio::stateAugmentation(const double& time) {
 
+  // IMU和相机的相对位姿，一般为左目
   const Matrix3d& R_i_c = state_server.imu_state.R_imu_cam0;
   const Vector3d& t_c_i = state_server.imu_state.t_cam0_imu;
 
   // Add a new camera state to the state server.
+  // R_w_c 世界坐标系相对于相机坐标系的旋转量
+  // t_c_w 相机相对于世界坐标系的平移量
   Matrix3d R_w_i = quaternionToRotation(
       state_server.imu_state.orientation);
   Matrix3d R_w_c = R_i_c * R_w_i;
   Vector3d t_c_w = state_server.imu_state.position +
     R_w_i.transpose()*t_c_i;
-
+  // cam_states 保留的是当前窗口图像信息，后面滑窗的时候要用
+  // id当前时刻的ID，将相机状态赋值ID
+  // cam_state 接下去求相机的位姿，利用这个位姿可以求解观测方程
   state_server.cam_states[state_server.imu_state.id] =
     CAMState(state_server.imu_state.id);
   CAMState& cam_state = state_server.cam_states[
     state_server.imu_state.id];
-
+  // 赋予相机状态时间
+  // 通过之前的求解的预测值和IMU与相机的相对位姿，求解的相机的位姿
   cam_state.time = time;
   cam_state.orientation = rotationToQuaternion(R_w_c);
   cam_state.position = t_c_w;
-
+  // 此处需要记录系统状态的预测值相对应的相机状态的预测值，用于后面的维持零空间不崩塌
   cam_state.orientation_null = cam_state.orientation;
   cam_state.position_null = cam_state.position;
 
@@ -821,6 +830,7 @@ void MsckfVio::stateAugmentation(const double& time) {
   // in Equation (16) in "A Multi-State Constraint Kalman Filter for Vision
   // -aided Inertial Navigation".
   // 相机位姿对状态向量雅克比求解，用于协方差矩阵的增广
+  // 先求 雅克比矩阵J
   Matrix<double, 6, 21> J = Matrix<double, 6, 21>::Zero();
   J.block<3, 3>(0, 0) = R_i_c;
   J.block<3, 3>(0, 15) = Matrix3d::Identity();
@@ -851,40 +861,50 @@ void MsckfVio::stateAugmentation(const double& time) {
     J * P11 * J.transpose();
 
   // Fix the covariance to be symmetric
+  // 
   MatrixXd state_cov_fixed = (state_server.state_cov +
       state_server.state_cov.transpose()) / 2.0;
   state_server.state_cov = state_cov_fixed;
 
   return;
 }
-// 构造map_server 观测信息
+/**
+ * @brief 通过前端传入的特征信息进行稀疏地图的构建
+ * @param msg            // 左右目特征信息
+
+ * @return  void
+ */
 void MsckfVio::addFeatureObservations(
     const CameraMeasurementConstPtr& msg) {
-
+  // 取出当前帧的ID
   StateIDType state_id = state_server.imu_state.id;
+  // 当前时刻map_server中特征点个数
   int curr_feature_num = map_server.size();
   int tracked_feature_num = 0;
 
   // Add new observations for existing features or new
   // features in the map server.
   //将特征点信息按照ID放入map_server结构中
-  // 计算跟踪率
   for (const auto& feature : msg->features) {
+    // 如果在地图中没找到对应的ID，那么认为是新的特征点
     if (map_server.find(feature.id) == map_server.end()) {
       // This is a new feature.
       map_server[feature.id] = Feature(feature.id);
+      // 将对应的双目观测信息放入observations中
       map_server[feature.id].observations[state_id] =
         Vector4d(feature.u0, feature.v0,
             feature.u1, feature.v1);
     } else {
       // This is an old feature.
+      // 如果找到了就相同的特征点ID下放入观测信息
       map_server[feature.id].observations[state_id] =
         Vector4d(feature.u0, feature.v0,
             feature.u1, feature.v1);
+      // 计算跟踪率
       ++tracked_feature_num;
     }
   }
-
+  //跟踪率
   tracking_rate =
     static_cast<double>(tracked_feature_num) /
     static_cast<double>(curr_feature_num);
@@ -1153,14 +1173,22 @@ bool MsckfVio::gatingTest(
   }
 }
 
+/**
+ * @brief 边缘化丢失的3D点进行ekf更新，得到系统状态估计值
+ * @param 
+ * @return  void
+ */
 void MsckfVio::removeLostFeatures() {
 
   // Remove the features that lost track.
   // BTW, find the size the final Jacobian matrix and residual vector.
+  // jacobian_row_size 记录H矩阵的维度
   int jacobian_row_size = 0;
+  // 不可用的特征点ID，后面需要从地图中清除
   vector<FeatureIDType> invalid_feature_ids(0);
+  // 跟踪丢失的特征点ID，需要拿来通过观测方程进行滤波更新的
   vector<FeatureIDType> processed_feature_ids(0);
-
+  //  先从map_server中遍历所有的特征点
   for (auto iter = map_server.begin();
       iter != map_server.end(); ++iter) {
     // Rename the feature to be checked.
@@ -1178,8 +1206,9 @@ void MsckfVio::removeLostFeatures() {
 
     // Check if the feature can be initialized if it
     // has not been.
-    // 是否计算出世界坐标系的3D点
+    // 是否计算出世界坐标系的3D点，如果不能也将放入其中invalid_feature_ids进行剔除
     if (!feature.is_initialized) {
+      // 
       if (!feature.checkMotion(state_server.cam_states)) {
         invalid_feature_ids.push_back(feature.id);
         continue;
