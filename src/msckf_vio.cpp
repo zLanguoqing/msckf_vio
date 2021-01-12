@@ -911,12 +911,20 @@ void MsckfVio::addFeatureObservations(
 
   return;
 }
-
+/**
+ * @brief 计算一个特征点中的一个观测所对应的雅克比矩阵
+ * @param cam_state_id            // 相机ID
+ * @param  feature_id             // 特征点id
+ * @param  H_x                    // 状态量对应的雅克比矩阵
+ * @param  H_f                    // 特征点对应的雅克比矩阵
+ * @param  r                      // 残差
+ * @return  void
+ */
 void MsckfVio::measurementJacobian(
     const StateIDType& cam_state_id,
     const FeatureIDType& feature_id,
     Matrix<double, 4, 6>& H_x, Matrix<double, 4, 3>& H_f, Vector4d& r) {
-
+  // 现将特征点信息和相机状态信息取出
   // Prepare all the required data.
   const CAMState& cam_state = state_server.cam_states[cam_state_id];
   const Feature& feature = map_server[feature_id];
@@ -988,16 +996,25 @@ void MsckfVio::measurementJacobian(
   return;
 }
 
+/**
+ * @brief 计算一个特征点多帧观测的雅克比矩阵
+ * @param feature_id    特征点ID
+ * @param cam_state_ids 特征点feature_id对应的相机状态
+ * @param H_x           雅克比矩阵
+ * @param r             残差
+ * @return  void
+ */
 void MsckfVio::featureJacobian(
     const FeatureIDType& feature_id,
     const std::vector<StateIDType>& cam_state_ids,
     MatrixXd& H_x, VectorXd& r) {
-
+    // 先将feature_id对应的信息取出
   const auto& feature = map_server[feature_id];
 
   // Check how many camera states in the provided camera
   // id camera has actually seen this feature.
-  vector<StateIDType> valid_cam_state_ids(0);
+  vector<StateIDType> valid_cam_state_ids(0);、
+  // 再确认观测对应的相机是否存在
   for (const auto& cam_id : cam_state_ids) {
     if (feature.observations.find(cam_id) ==
         feature.observations.end()) continue;
@@ -1006,14 +1023,15 @@ void MsckfVio::featureJacobian(
   }
 
   int jacobian_row_size = 0;
+  // 一个观测对应的4维，所有观测对应的是4 * valid_cam_state_ids.size()
   jacobian_row_size = 4 * valid_cam_state_ids.size();
-
+  // 构建H_xj H_fj r_j
   MatrixXd H_xj = MatrixXd::Zero(jacobian_row_size,
       21+state_server.cam_states.size()*6);
   MatrixXd H_fj = MatrixXd::Zero(jacobian_row_size, 3);
   VectorXd r_j = VectorXd::Zero(jacobian_row_size);
   int stack_cntr = 0;
-
+  // 遍历伊特特征点的所有观测
   for (const auto& cam_id : valid_cam_state_ids) {
 
     Matrix<double, 4, 6> H_xi = Matrix<double, 4, 6>::Zero();
@@ -1021,7 +1039,7 @@ void MsckfVio::featureJacobian(
     Vector4d r_i = Vector4d::Zero();
     // 计算一个特征点对一个观测的雅克比
     measurementJacobian(cam_id, feature.id, H_xi, H_fi, r_i);
-
+    // 再将每个雅克比按块放入H_xj中，得到一个特征点多帧观测的雅克比
     auto cam_state_iter = state_server.cam_states.find(cam_id);
     int cam_state_cntr = std::distance(
         state_server.cam_states.begin(), cam_state_iter);
@@ -1035,7 +1053,7 @@ void MsckfVio::featureJacobian(
 
   // Project the residual and Jacobians onto the nullspace
   // of H_fj.
-  // 计算做零空间，消去特征点的影响
+  // 计算做零空间，消去特征点H_fj的影响
   JacobiSVD<MatrixXd> svd_helper(H_fj, ComputeFullU | ComputeThinV);
   MatrixXd A = svd_helper.matrixU().rightCols(
       jacobian_row_size - 3);
@@ -1152,10 +1170,16 @@ void MsckfVio::measurementUpdate(
 
   return;
 }
-
+/**
+ * @brief 卡方检验，检测一个特征点对应的多帧观测能不能满足观测的规律
+ * @param H   雅克比矩阵
+ * @param r   残差
+ * @param dof 卡方表需要的自由度
+ * @return  bool
+ */
 bool MsckfVio::gatingTest(
     const MatrixXd& H, const VectorXd& r, const int& dof) {
-
+  // 计算卡方值
   MatrixXd P1 = H * state_server.state_cov * H.transpose();
   MatrixXd P2 = Feature::observation_noise *
     MatrixXd::Identity(H.rows(), H.rows());
@@ -1163,7 +1187,7 @@ bool MsckfVio::gatingTest(
 
   //cout << dof << " " << gamma << " " <<
   //  chi_squared_test_table[dof] << " ";
-
+  // 通过自由度查表阈值
   if (gamma < chi_squared_test_table[dof]) {
     //cout << "passed" << endl;
     return true;
@@ -1208,18 +1232,21 @@ void MsckfVio::removeLostFeatures() {
     // has not been.
     // 是否计算出世界坐标系的3D点，如果不能也将放入其中invalid_feature_ids进行剔除
     if (!feature.is_initialized) {
-      // 
+      // 判断是否发生了足够的移动，能够三角化成功
       if (!feature.checkMotion(state_server.cam_states)) {
         invalid_feature_ids.push_back(feature.id);
         continue;
       } else {
+        // 三角化，计算3D点
         if(!feature.initializePosition(state_server.cam_states)) {
           invalid_feature_ids.push_back(feature.id);
           continue;
         }
       }
     }
-
+    // 一个观测，由于存在左右目坐标，所以是4维，一个特征点可以被多帧观测到
+    // 所以4×observations.size()，因为在求雅克比的时候需要剔除hf的影响，需要乘以左零空间
+    // 所以需要减去3
     jacobian_row_size += 4*feature.observations.size() - 3;
     processed_feature_ids.push_back(feature.id);
   }
@@ -1230,22 +1257,27 @@ void MsckfVio::removeLostFeatures() {
   //cout << "jacobian row #: " << jacobian_row_size << endl;
 
   // Remove the features that do not have enough measurements.
+  // 清除不可用的观测值
   for (const auto& feature_id : invalid_feature_ids)
     map_server.erase(feature_id);
 
   // Return if there is no lost feature to be processed.
+  // 如果用于可更新的观测值为0，则返回
   if (processed_feature_ids.size() == 0) return;
-
+  // 构建大的雅克比矩阵和残差
   MatrixXd H_x = MatrixXd::Zero(jacobian_row_size,
       21+6*state_server.cam_states.size());
   VectorXd r = VectorXd::Zero(jacobian_row_size);
   int stack_cntr = 0;
 
   // Process the features which lose track.
+  // 遍历跟踪丢失的且观测大于3的特征点
   for (const auto& feature_id : processed_feature_ids) {
+    // 先取出这个特征点的所有信息
     auto& feature = map_server[feature_id];
 
     vector<StateIDType> cam_state_ids(0);
+    // 再将每个观测信息中对应的相机ID记录
     for (const auto& measurement : feature.observations)
       cam_state_ids.push_back(measurement.first);
 
@@ -1264,7 +1296,7 @@ void MsckfVio::removeLostFeatures() {
     // which helps guarantee the executation time.
     if (stack_cntr > 1500) break;
   }
-
+  // 重新构建雅克比矩阵和残差
   H_x.conservativeResize(stack_cntr, H_x.cols());
   r.conservativeResize(stack_cntr);
 
@@ -1273,12 +1305,18 @@ void MsckfVio::removeLostFeatures() {
   measurementUpdate(H_x, r);
 
   // Remove all processed features from the map.
+  // 边缘化
   for (const auto& feature_id : processed_feature_ids)
     map_server.erase(feature_id);
 
   return;
 }
 
+/**
+ * @brief   滑窗，如果满足条件则剔除17帧，否则剔除第一帧
+ * @param   rm_cam_state_ids    //需要剔除的相机ID
+ * @return  void
+ */
 void MsckfVio::findRedundantCamStates(
     vector<StateIDType>& rm_cam_state_ids) {
 
@@ -1326,18 +1364,25 @@ void MsckfVio::findRedundantCamStates(
 
   return;
 }
-// 滑窗，并将剔除的帧上的特征点进行滤波更新
+ 
+/**
+ * @brief   滑窗，并将剔除的帧上的特征点进行滤波更新
+ * @param 
+ * @return  void
+ */
 void MsckfVio::pruneCamStateBuffer() {
-
+  // 如果没满，则不滑窗
   if (state_server.cam_states.size() < max_cam_state_size)
     return;
 
   // Find two camera states to be removed.
   vector<StateIDType> rm_cam_state_ids(0);
+  // 计算需要剔除的相机帧
   findRedundantCamStates(rm_cam_state_ids);
 
   // Find the size of the Jacobian matrix.
   int jacobian_row_size = 0;
+  // 在地图点中，找到需要剔除的帧上的特征点
   for (auto& item : map_server) {
     auto& feature = item.second;
     // Check how many camera states to be removed are associated
@@ -1348,31 +1393,36 @@ void MsckfVio::pruneCamStateBuffer() {
           feature.observations.end())
         involved_cam_state_ids.push_back(cam_id);
     }
-
+    // 如果没有找到involved_cam_state_ids=0则不用边缘化
     if (involved_cam_state_ids.size() == 0) continue;
+    // 如果只有一个，没法三角化，那就直接剔除
     if (involved_cam_state_ids.size() == 1) {
       feature.observations.erase(involved_cam_state_ids[0]);
       continue;
     }
-
+    // 如果特征点没有三角化，则进行三角化
     if (!feature.is_initialized) {
       // Check if the feature can be initialize.
+      // 是否可以进行三角化
       if (!feature.checkMotion(state_server.cam_states)) {
         // If the feature cannot be initialized, just remove
         // the observations associated with the camera states
         // to be removed.
+        // 如果不能三角化，那直接剔除
         for (const auto& cam_id : involved_cam_state_ids)
           feature.observations.erase(cam_id);
         continue;
       } else {
+        // 如果可以三角化，则进行三角化
         if(!feature.initializePosition(state_server.cam_states)) {
+          // 如果不能三角化，就剔除
           for (const auto& cam_id : involved_cam_state_ids)
             feature.observations.erase(cam_id);
           continue;
         }
       }
     }
-
+    // 计算雅克比矩阵行的维度
     jacobian_row_size += 4*involved_cam_state_ids.size() - 3;
   }
 
@@ -1383,7 +1433,7 @@ void MsckfVio::pruneCamStateBuffer() {
       21+6*state_server.cam_states.size());
   VectorXd r = VectorXd::Zero(jacobian_row_size);
   int stack_cntr = 0;
-
+  // 遍历地图点，计算雅克比矩阵
   for (auto& item : map_server) {
     auto& feature = item.second;
     // Check how many camera states to be removed are associated
@@ -1406,7 +1456,7 @@ void MsckfVio::pruneCamStateBuffer() {
       r.segment(stack_cntr, r_j.rows()) = r_j;
       stack_cntr += H_xj.rows();
     }
-
+    // 然后从特征点的观测中剔除这需要边缘化的这两帧
     for (const auto& cam_id : involved_cam_state_ids)
       feature.observations.erase(cam_id);
   }
@@ -1415,8 +1465,9 @@ void MsckfVio::pruneCamStateBuffer() {
   r.conservativeResize(stack_cntr);
 
   // Perform measurement update.
+  // 滤波更新，更新状态量和协方差矩阵
   measurementUpdate(H_x, r);
-
+  // 在从协方差矩阵中剔除这两帧信息
   for (const auto& cam_id : rm_cam_state_ids) {
     int cam_sequence = std::distance(state_server.cam_states.begin(),
         state_server.cam_states.find(cam_id));
